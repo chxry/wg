@@ -1,0 +1,16 @@
+[package]
+name = "w"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wgpu = "0.16"
+winit = "0.28"
+tokio = { version = "1.28", features = ["full"] }
+glam = "0.24"
+gltf = "1.1"
+egui = "0.21"
+egui_wgpu_backend = "0.23"
+egui-winit = "0.21"
+log = "0.4"
+ezlogger = "0.1"

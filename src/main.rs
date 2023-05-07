@@ -5,22 +5,18 @@ use winit::event::{Event, WindowEvent};
 use winit::dpi::PhysicalSize;
 use wgpu::util::DeviceExt;
 use egui_wgpu_backend::ScreenDescriptor;
-use glam::{Vec3, Vec2, Quat, Mat4, EulerRot};
+use glam::{Vec3, Vec2, Quat, Mat4,Mat3};
 use log::LevelFilter;
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-const SAMPLES: u32 = 8;
+const SAMPLES: u32 = 4;
 
 struct Node {
   name: String,
-  buf: wgpu::Buffer,
-  bind_group: wgpu::BindGroup,
-  pos: Vec3,
-  rot: Quat,
-  scale: Vec3,
+  transform: Transform,
   mesh: Mesh,
   tex: Texture<wgpu::BindGroup>,
 }
@@ -33,7 +29,7 @@ async fn main() -> Result {
   let renderer = Renderer::new(&window).await?;
 
   let size = window.inner_size();
-  let depth_tex = Texture::new(
+  let mut depth_tex = Texture::new(
     &renderer,
     DEPTH_FORMAT,
     wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -41,7 +37,7 @@ async fn main() -> Result {
     size.width,
     size.height,
   );
-  let fb = Texture::new(
+  let mut fb = Texture::new(
     &renderer,
     FORMAT,
     wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -49,84 +45,84 @@ async fn main() -> Result {
     size.width,
     size.height,
   );
-  let cam = Camera::new(&renderer);
 
-  let (doc, buffers, images) = gltf::import("model.glb")?;
+  let (doc, buffers, images) = gltf::import("sponza.glb")?;
+  let cam = doc
+    .nodes()
+    .find_map(|n| {
+      n.camera().map(|c| {
+        let transform = n.transform().decomposed();
+        match c.projection() {
+          gltf::camera::Projection::Orthographic(o) => panic!(),
+          gltf::camera::Projection::Perspective(p) => Camera::new(
+            &renderer,
+            transform.0.into(),
+            Quat::from_array(transform.1),
+            p.yfov(),
+            [p.znear(), p.zfar().unwrap_or(100.0)],
+          ),
+        }
+      })
+    })
+    .unwrap();
   let mut nodes: Vec<_> = doc
     .nodes()
-    .map(|n| {
+    .filter_map(|n| {
       let name = n.name().unwrap_or("?").to_string();
       let transform = n.transform().decomposed();
-
-      let buf = renderer.device.create_buffer(&wgpu::BufferDescriptor {
-        size: mem::size_of::<Mat4>() as _,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-        label: None,
-      });
-      let bind_group = renderer
-        .device
-        .create_bind_group(&wgpu::BindGroupDescriptor {
-          layout: &renderer.model_bind_group_layout,
-          entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: buf.as_entire_binding(),
-          }],
-          label: None,
-        });
-      let mesh = n.mesh().unwrap();
-      let primitive = mesh.primitives().next().unwrap();
-      let reader = primitive.reader(|b| Some(&buffers[b.index()]));
-
-      let verts: Vec<_> = reader
-        .read_positions()
-        .unwrap()
-        .zip(reader.read_tex_coords(0).unwrap().into_f32())
-        .map(|(p, u)| Vertex {
-          pos: p.into(),
-          uv: u.into(),
-        })
-        .collect();
-      let indices: Vec<_> = reader.read_indices().unwrap().into_u32().collect();
-      let mesh = Mesh::new(&renderer, &verts, &indices);
-
-      let image = &images[primitive
-        .material()
-        .pbr_metallic_roughness()
-        .base_color_texture()
-        .unwrap()
-        .texture()
-        .source()
-        .index()];
-      let tex = Texture::new(
+      let transform = Transform::new(
         &renderer,
-        wgpu::TextureFormat::Rgba8UnormSrgb,
-        wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        1,
-        image.width,
-        image.height,
-      )
-      .create_bind_group(&renderer);
-      tex.write(
-        &renderer,
-        &image
-          .pixels
-          .chunks_exact(3)
-          .flat_map(|a| [a[0], a[1], a[2], 255])
-          .collect::<Vec<_>>(),
+        transform.0.into(),
+        Quat::from_array(transform.1),
+        transform.2.into(),
       );
-      Node {
-        name,
-        buf,
-        bind_group,
-        pos: transform.0.into(),
-        rot: Quat::from_array(transform.1),
-        scale: transform.2.into(),
-        mesh,
-        tex,
-      }
+
+      n.mesh().map(|mesh| {
+        let primitive = mesh.primitives().next().unwrap();
+        let reader = primitive.reader(|b| Some(&buffers[b.index()]));
+
+        let verts: Vec<_> = reader
+          .read_positions()
+          .unwrap()
+          .zip(reader.read_tex_coords(0).unwrap().into_f32())
+          .zip(reader.read_normals().unwrap())
+          .map(|((p, u), n)| Vertex {
+            pos: p.into(),
+            uv: u.into(),
+            normal: n.into(),
+          })
+          .collect();
+        let indices: Vec<_> = reader.read_indices().unwrap().into_u32().collect();
+        let mesh = Mesh::new(&renderer, &verts, &indices);
+
+        let image = &images[primitive
+          .material()
+          .pbr_metallic_roughness()
+          .base_color_texture()
+          .unwrap()
+          .texture()
+          .source()
+          .index()];
+        let tex = Texture::new(
+          &renderer,
+          wgpu::TextureFormat::Rgba8UnormSrgb,
+          wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+          1,
+          image.width(),
+          image.height(),
+        )
+        .create_bind_group(&renderer);
+        tex.write(&renderer, &image.to_rgba8());
+        Node {
+          name,
+          transform,
+          mesh,
+          tex,
+        }
+      })
     })
     .collect();
+  let light = Light::new(&renderer, Vec3::new(0.0, 3.0, 3.0), Vec3::ONE);
 
   let ctx = egui::Context::default();
   ctx.set_pixels_per_point(window.scale_factor() as _);
@@ -137,7 +133,25 @@ async fn main() -> Result {
     Event::WindowEvent { event, .. } => {
       if !egui_platform.on_event(&ctx, &event).consumed {
         match event {
-          WindowEvent::Resized(size) => renderer.resize(size),
+          WindowEvent::Resized(size) => {
+            renderer.resize(size);
+            depth_tex = Texture::new(
+              &renderer,
+              DEPTH_FORMAT,
+              wgpu::TextureUsages::RENDER_ATTACHMENT,
+              SAMPLES,
+              size.width,
+              size.height,
+            );
+            fb = Texture::new(
+              &renderer,
+              FORMAT,
+              wgpu::TextureUsages::RENDER_ATTACHMENT,
+              SAMPLES,
+              size.width,
+              size.height,
+            );
+          }
           WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
           _ => {}
         }
@@ -146,9 +160,8 @@ async fn main() -> Result {
     Event::RedrawRequested(..) => {
       ctx.begin_frame(egui_platform.take_egui_input(&window));
       egui::Window::new("hello floppa").show(&ctx, |ui| {
-        let mut e = nodes[0].rot.to_euler(EulerRot::XYZ);
-        if ui.drag_angle(&mut e.2).changed() {
-          nodes[0].rot = Quat::from_euler(EulerRot::XYZ, e.0, e.1, e.2);
+        for node in &nodes {
+          ui.collapsing(node.name.clone(), |ui| ui.label("floppa"));
         }
       });
       let egui_out = ctx.end_frame();
@@ -198,14 +211,10 @@ async fn main() -> Result {
         &mut render_pass,
         surface.texture.width() as f32 / surface.texture.height() as f32,
       );
+      light.bind(&renderer, &mut render_pass);
       for node in &nodes {
         node.tex.bind(&mut render_pass);
-        renderer.queue.write_buffer(&node.buf, 0, unsafe {
-          cast_slice(&[Mat4::from_scale_rotation_translation(
-            node.scale, node.rot, node.pos,
-          )])
-        });
-        render_pass.set_bind_group(2, &node.bind_group, &[]);
+        node.transform.bind(&renderer, &mut render_pass);
         node.mesh.render(&mut render_pass);
       }
       drop(render_pass);
@@ -227,9 +236,6 @@ struct Renderer {
   device: wgpu::Device,
   queue: wgpu::Queue,
   sampler: wgpu::Sampler,
-  tex_bind_group_layout: wgpu::BindGroupLayout,
-  model_bind_group_layout: wgpu::BindGroupLayout,
-  cam_bind_group_layout: wgpu::BindGroupLayout,
   pipeline: wgpu::RenderPipeline,
 }
 
@@ -267,65 +273,8 @@ impl Renderer {
     });
 
     let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
-    let tex_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-      entries: &[
-        wgpu::BindGroupLayoutEntry {
-          binding: 0,
-          visibility: wgpu::ShaderStages::FRAGMENT,
-          ty: wgpu::BindingType::Texture {
-            multisampled: false,
-            view_dimension: wgpu::TextureViewDimension::D2,
-            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-          },
-          count: None,
-        },
-        wgpu::BindGroupLayoutEntry {
-          binding: 1,
-          visibility: wgpu::ShaderStages::FRAGMENT,
-          ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-          count: None,
-        },
-      ],
-      label: None,
-    });
-    let cam_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-      entries: &[wgpu::BindGroupLayoutEntry {
-        binding: 0,
-        visibility: wgpu::ShaderStages::VERTEX,
-        ty: wgpu::BindingType::Buffer {
-          ty: wgpu::BufferBindingType::Uniform,
-          has_dynamic_offset: false,
-          min_binding_size: None,
-        },
-        count: None,
-      }],
-      label: None,
-    });
-    let model_bind_group_layout =
-      device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        entries: &[wgpu::BindGroupLayoutEntry {
-          binding: 0,
-          visibility: wgpu::ShaderStages::VERTEX,
-          ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Uniform,
-            has_dynamic_offset: false,
-            min_binding_size: None,
-          },
-          count: None,
-        }],
-        label: None,
-      });
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-      bind_group_layouts: &[
-        &tex_bind_group_layout,
-        &cam_bind_group_layout,
-        &model_bind_group_layout,
-      ],
-      push_constant_ranges: &[],
-      label: None,
-    });
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-      layout: Some(&pipeline_layout),
+      layout: None,
       vertex: wgpu::VertexState {
         module: &shader,
         entry_point: "vs_main",
@@ -362,9 +311,6 @@ impl Renderer {
       device,
       queue,
       sampler,
-      tex_bind_group_layout,
-      model_bind_group_layout,
-      cam_bind_group_layout,
       pipeline,
     };
     r.resize(window.inner_size());
@@ -391,13 +337,14 @@ impl Renderer {
 struct Vertex {
   pos: Vec3,
   uv: Vec2,
+  normal: Vec3,
 }
 
 impl Vertex {
   const DESC: wgpu::VertexBufferLayout<'_> = wgpu::VertexBufferLayout {
     array_stride: mem::size_of::<Self>() as _,
     step_mode: wgpu::VertexStepMode::Vertex,
-    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2],
+    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Float32x3],
   };
 }
 struct Mesh {
@@ -479,7 +426,7 @@ impl Texture {
     let bind_group = renderer
       .device
       .create_bind_group(&wgpu::BindGroupDescriptor {
-        layout: &renderer.tex_bind_group_layout,
+        layout: &renderer.pipeline.get_bind_group_layout(0),
         entries: &[
           wgpu::BindGroupEntry {
             binding: 0,
@@ -536,7 +483,7 @@ struct Camera {
 }
 
 impl Camera {
-  fn new(renderer: &Renderer) -> Self {
+  fn new(renderer: &Renderer, pos: Vec3, rot: Quat, fov: f32, clip: [f32; 2]) -> Self {
     let buf = renderer.device.create_buffer(&wgpu::BufferDescriptor {
       size: mem::size_of::<CameraUniform>() as _,
       usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
@@ -546,7 +493,7 @@ impl Camera {
     let bind_group = renderer
       .device
       .create_bind_group(&wgpu::BindGroupDescriptor {
-        layout: &renderer.cam_bind_group_layout,
+        layout: &renderer.pipeline.get_bind_group_layout(2),
         entries: &[wgpu::BindGroupEntry {
           binding: 0,
           resource: buf.as_entire_binding(),
@@ -554,10 +501,10 @@ impl Camera {
         label: None,
       });
     Self {
-      pos: Vec3::new(0.0, -6.0, 3.0),
-      rot: Quat::from_rotation_x(1.5),
-      fov: 80.0,
-      clip: [0.1, 100.0],
+      pos,
+      rot,
+      fov,
+      clip,
       buf,
       bind_group,
     }
@@ -567,10 +514,10 @@ impl Camera {
     renderer.queue.write_buffer(&self.buf, 0, unsafe {
       cast_slice(&[CameraUniform {
         view: Mat4::look_to_rh(self.pos, self.rot * Vec3::NEG_Z, Vec3::Z),
-        proj: Mat4::perspective_rh(self.fov.to_radians(), aspect, self.clip[0], self.clip[1]),
+        proj: Mat4::perspective_rh(self.fov, aspect, self.clip[0], self.clip[1]),
       }])
     });
-    render_pass.set_bind_group(1, &self.bind_group, &[]);
+    render_pass.set_bind_group(2, &self.bind_group, &[]);
   }
 }
 
@@ -579,4 +526,111 @@ impl Camera {
 struct CameraUniform {
   view: Mat4,
   proj: Mat4,
+}
+
+struct Transform {
+  pos: Vec3,
+  rot: Quat,
+  scale: Vec3,
+  buf: wgpu::Buffer,
+  bind_group: wgpu::BindGroup,
+}
+
+impl Transform {
+  fn new(renderer: &Renderer, pos: Vec3, rot: Quat, scale: Vec3) -> Self {
+    let buf = renderer.device.create_buffer(&wgpu::BufferDescriptor {
+      size: mem::size_of::<TransformUniform>() as _,
+      usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+      mapped_at_creation: false,
+      label: None,
+    });
+    let bind_group = renderer
+      .device
+      .create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &renderer.pipeline.get_bind_group_layout(1),
+
+        entries: &[wgpu::BindGroupEntry {
+          binding: 0,
+          resource: buf.as_entire_binding(),
+        }],
+        label: None,
+      });
+    Self {
+      pos,
+      rot,
+      scale,
+      buf,
+      bind_group,
+    }
+  }
+
+  fn bind<'a>(&'a self, renderer: &Renderer, render_pass: &mut wgpu::RenderPass<'a>) {
+    renderer.queue.write_buffer(&self.buf, 0, unsafe {
+      cast_slice(&[TransformUniform {
+        model: Mat4::from_scale_rotation_translation(self.scale, self.rot, self.pos),
+        normal: Mat3::from_quat(self.rot)
+      }])
+    });
+    render_pass.set_bind_group(1, &self.bind_group, &[]);
+  }
+}
+
+#[repr(C)]
+struct TransformUniform {
+  model: Mat4,
+  normal: Mat3
+}
+
+struct Light {
+  pos: Vec3,
+  color: Vec3,
+  buf: wgpu::Buffer,
+  bind_group: wgpu::BindGroup,
+}
+
+impl Light {
+  fn new(renderer: &Renderer, pos: Vec3, color: Vec3) -> Self {
+    let buf = renderer.device.create_buffer(&wgpu::BufferDescriptor {
+      size: mem::size_of::<LightUniform>() as _,
+      usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+      mapped_at_creation: false,
+      label: None,
+    });
+    let bind_group = renderer
+      .device
+      .create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &renderer.pipeline.get_bind_group_layout(3),
+        entries: &[wgpu::BindGroupEntry {
+          binding: 0,
+          resource: buf.as_entire_binding(),
+        }],
+        label: None,
+      });
+    Self {
+      pos,
+      color,
+      buf,
+      bind_group,
+    }
+  }
+
+  fn bind<'a>(&'a self, renderer: &Renderer, render_pass: &mut wgpu::RenderPass<'a>) {
+    renderer.queue.write_buffer(&self.buf, 0, unsafe {
+      cast_slice(&[LightUniform {
+        pos: self.pos,
+        __: 0,
+        color: self.color,
+        ___: 0,
+      }])
+    });
+    render_pass.set_bind_group(3, &self.bind_group, &[]);
+  }
+}
+
+#[repr(C)]
+struct LightUniform {
+  pos: Vec3,
+  __: u32,
+  color: Vec3,
+  ___: u32,
 }
